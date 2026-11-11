@@ -80,6 +80,7 @@ create table if not exists public.clients (
   created_at    timestamptz not null default now(),
   updated_at    timestamptz not null default now()
 );
+alter table public.clients add column if not exists followup_time time;
 create index if not exists clients_seller_idx on public.clients (seller_id);
 create index if not exists clients_group_idx  on public.clients (group_id);
 
@@ -177,9 +178,65 @@ create table if not exists public.messages (
 );
 create index if not exists messages_group_idx on public.messages (group_id, created_at);
 
+-- Notificaciones (campanita)
+create table if not exists public.notifications (
+  id         uuid primary key default gen_random_uuid(),
+  user_id    uuid not null references public.profiles(id) on delete cascade,
+  kind       text not null default 'info',
+  title      text not null,
+  body       text not null default '',
+  link       text not null default '',
+  read       boolean not null default false,
+  created_at timestamptz not null default now()
+);
+create index if not exists notifications_user_idx on public.notifications (user_id, created_at desc);
+
+-- Hasta dónde leyó cada usuario cada conversación (para los "sin leer")
+create table if not exists public.chat_reads (
+  user_id      uuid not null references public.profiles(id) on delete cascade,
+  thread       text not null,                 -- 'grupo' o el id del otro usuario
+  last_read_at timestamptz not null default now(),
+  primary key (user_id, thread)
+);
+
+-- Pagos de comisiones al vendedor (cobros)
+create table if not exists public.payouts (
+  id         uuid primary key default gen_random_uuid(),
+  group_id   uuid not null references public.groups(id) on delete cascade,
+  seller_id  uuid not null references public.profiles(id) on delete cascade,
+  amount     numeric(14,0) not null check (amount > 0),
+  note       text not null default '',
+  created_by uuid references public.profiles(id) on delete set null,
+  created_at timestamptz not null default now()
+);
+create index if not exists payouts_seller_idx on public.payouts (seller_id, created_at);
+
+-- Cotizaciones guardadas por el vendedor
+create table if not exists public.quotes (
+  id            uuid primary key default gen_random_uuid(),
+  group_id      uuid not null references public.groups(id) on delete cascade,
+  seller_id     uuid not null references public.profiles(id) on delete cascade,
+  client_id     uuid references public.clients(id) on delete set null,
+  client_name   text not null default '',
+  items         jsonb not null default '[]'::jsonb,
+  once_total    numeric(14,0) not null default 0,
+  monthly_total numeric(14,0) not null default 0,
+  created_at    timestamptz not null default now()
+);
+create index if not exists quotes_seller_idx on public.quotes (seller_id, created_at);
+
 -- ---------------------------------------------------------------------
 -- 2. FUNCIONES AUXILIARES
 -- ---------------------------------------------------------------------
+
+-- Crea una notificación (solo la usan las funciones del sistema)
+create or replace function public.notify(p_user uuid, p_kind text, p_title text, p_body text, p_link text)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if p_user is null then return; end if;
+  insert into public.notifications (user_id, kind, title, body, link)
+  values (p_user, coalesce(p_kind, 'info'), p_title, coalesce(p_body, ''), coalesce(p_link, ''));
+end $$;
 
 -- Grupo y rol del usuario actual (solo si su cuenta está activa)
 create or replace function public.my_group() returns uuid
@@ -253,6 +310,8 @@ begin
     if not found then raise exception 'Código de grupo inválido'; end if;
     insert into public.profiles (id, role, email, username, whatsapp, group_id, status)
     values (new.id, 'vendedor', new.email, v_user, v_wa, v_group.id, 'pendiente');
+    perform public.notify(v_group.coordinator_id, 'solicitud', 'Nueva solicitud de ingreso',
+                          v_user || ' quiere unirse a tu grupo.', 'equipo');
   else
     insert into public.profiles (id, role, email, username, whatsapp, status)
     values (new.id, 'coordinador', new.email, v_user, v_wa, 'activo');
@@ -342,6 +401,27 @@ drop trigger if exists catalog_price_changed_t on public.catalog;
 create trigger catalog_price_changed_t after update on public.catalog
   for each row execute function public.catalog_price_changed();
 
+-- Cuando el coordinador cambia un precio, avisa a sus vendedores activos
+create or replace function public.group_prices_notify() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare v_name text; v_kind text;
+begin
+  if new.sale_price is distinct from old.sale_price or new.seller_commission is distinct from old.seller_commission then
+    select name, kind into v_name, v_kind from public.catalog where id = new.catalog_id;
+    if v_kind = 'unica' then
+      insert into public.notifications (user_id, kind, title, body, link)
+      select p.id, 'precio', 'Precio actualizado: ' || v_name,
+             'Ahora $' || to_char(new.sale_price, 'FM999G999G999G999') || ' · tu comisión $' || to_char(new.seller_commission, 'FM999G999G999G999'),
+             'productos'
+      from public.profiles p where p.group_id = new.group_id and p.role = 'vendedor' and p.status = 'activo';
+    end if;
+  end if;
+  return null;
+end $$;
+drop trigger if exists group_prices_notify_t on public.group_prices;
+create trigger group_prices_notify_t after update on public.group_prices
+  for each row execute function public.group_prices_notify();
+
 -- Propietario automático (nadie puede falsificar de quién es un registro)
 create or replace function public.set_owner() returns trigger
 language plpgsql security definer set search_path = public as $$
@@ -353,6 +433,9 @@ begin
 end $$;
 drop trigger if exists clients_owner_t on public.clients;
 create trigger clients_owner_t before insert on public.clients
+  for each row execute function public.set_owner();
+drop trigger if exists quotes_owner_t on public.quotes;
+create trigger quotes_owner_t before insert on public.quotes
   for each row execute function public.set_owner();
 drop trigger if exists activities_owner_t on public.activities;
 create trigger activities_owner_t before insert on public.activities
@@ -414,6 +497,10 @@ begin
   update public.profiles set status = p_status
   where id = p_seller and group_id = my_group() and role = 'vendedor';
   if not found then raise exception 'Vendedor no encontrado en tu grupo'; end if;
+  perform public.notify(p_seller, 'cuenta',
+    case p_status when 'activo' then 'Tu ingreso fue aprobado' when 'rechazado' then 'Tu solicitud fue rechazada' else 'Se retiró tu acceso al grupo' end,
+    case p_status when 'activo' then 'Ya puedes registrar clientes y ventas.' else 'Escríbele a tu coordinador si tienes dudas.' end,
+    'resumen');
 end $$;
 
 -- Coordinador: meta mensual de un vendedor
@@ -425,7 +512,40 @@ begin
   update public.profiles set monthly_goal = round(p_amount)
   where id = p_seller and group_id = my_group() and role = 'vendedor';
   if not found then raise exception 'Vendedor no encontrado en tu grupo'; end if;
+  perform public.notify(p_seller, 'meta', 'Nueva meta mensual', 'Tu coordinador definió tu meta en $' || to_char(round(p_amount), 'FM999G999G999G999'), 'resumen');
 end $$;
+
+-- Coordinador: registrar un pago de comisiones al vendedor (cobro)
+create or replace function public.register_payout(p_seller uuid, p_amount numeric, p_note text default '')
+returns public.payouts
+language plpgsql security definer set search_path = public as $$
+declare po public.payouts%rowtype;
+begin
+  if my_role() is distinct from 'coordinador' then raise exception 'Solo el coordinador puede hacer esto'; end if;
+  if p_amount is null or p_amount <= 0 then raise exception 'El monto debe ser mayor a cero'; end if;
+  if not exists (select 1 from public.profiles where id = p_seller and group_id = my_group() and role = 'vendedor') then
+    raise exception 'Vendedor no encontrado en tu grupo';
+  end if;
+  insert into public.payouts (group_id, seller_id, amount, note, created_by)
+  values (my_group(), p_seller, round(p_amount), coalesce(p_note, ''), auth.uid()) returning * into po;
+  perform public.notify(p_seller, 'cobro', 'Te registraron un pago de comisiones',
+    '$' || to_char(po.amount, 'FM999G999G999G999') || case when po.note <> '' then ' · ' || po.note else '' end, 'ventas/cobros');
+  return po;
+end $$;
+
+-- Marcar notificaciones como leídas (todas, o solo las indicadas)
+create or replace function public.mark_notifications_read(p_ids uuid[] default null) returns void
+language sql security definer set search_path = public as $$
+  update public.notifications set read = true
+  where user_id = auth.uid() and read = false and (p_ids is null or id = any(p_ids))
+$$;
+
+-- Marcar una conversación como leída
+create or replace function public.mark_chat_read(p_thread text) returns void
+language sql security definer set search_path = public as $$
+  insert into public.chat_reads (user_id, thread, last_read_at) values (auth.uid(), p_thread, now())
+  on conflict (user_id, thread) do update set last_read_at = now()
+$$;
 
 -- Vendedor: registrar una venta (los precios los toma el servidor, no el navegador)
 create or replace function public.create_sale(p_client uuid, p_catalog uuid, p_notes text default '')
@@ -465,6 +585,9 @@ begin
     values (s.id, v_group, v_uid, c.id, cat.id, cat.name,
             gp.sale_price, cat.seller_pct, round(gp.sale_price * cat.seller_pct / 100));
   end if;
+  perform public.notify((select coordinator_id from public.groups where id = v_group), 'venta',
+    'Nueva venta ' || s.ticket,
+    (select username from public.profiles where id = v_uid) || ' vendió ' || s.product_name || ' a ' || c.name, 'ventas');
   return s;
 end $$;
 
@@ -507,6 +630,9 @@ begin
   exception when unique_violation then
     raise exception 'Ya existe un comprobante en revisión o aprobado para este pago';
   end;
+  perform public.notify((select coordinator_id from public.groups where id = v_group), 'pago',
+    'Comprobante por revisar',
+    (select username from public.profiles where id = v_uid) || ' subió un comprobante de $' || to_char(pay.amount, 'FM999G999G999G999'), 'ventas/pagos');
   return pay;
 end $$;
 
@@ -529,6 +655,10 @@ begin
       paid_at = case when p_approve then now() else null end
     where id = pay.sale_id;
   end if;
+  perform public.notify(pay.seller_id, 'pago',
+    case when p_approve then 'Comprobante aprobado' else 'Comprobante rechazado' end,
+    case when p_approve then 'Tu comisión pasó a confirmada.' else coalesce(nullif(p_note, ''), 'Sube uno nuevo.') end,
+    'ventas/pagos');
 end $$;
 
 -- Coordinador: estado de entrega de una venta
@@ -539,6 +669,10 @@ begin
   if p_status not in ('pendiente','en_desarrollo','entregado') then raise exception 'Estado inválido'; end if;
   update public.sales set delivery_status = p_status where id = p_sale and group_id = my_group();
   if not found then raise exception 'Venta no encontrada'; end if;
+  perform public.notify((select seller_id from public.sales where id = p_sale), 'entrega',
+    'Entrega actualizada: ' || (select ticket from public.sales where id = p_sale),
+    case p_status when 'entregado' then 'El producto fue entregado.' when 'en_desarrollo' then 'El producto está en desarrollo.' else 'El producto está por iniciar.' end,
+    'ventas');
 end $$;
 
 -- Coordinador: pausar / cancelar / reactivar una suscripción
@@ -549,6 +683,8 @@ begin
   if p_status not in ('activa','pausada','cancelada') then raise exception 'Estado inválido'; end if;
   update public.subscriptions set status = p_status where id = p_sub and group_id = my_group();
   if not found then raise exception 'Suscripción no encontrada'; end if;
+  perform public.notify((select seller_id from public.subscriptions where id = p_sub), 'suscripcion',
+    'Suscripción ' || p_status, (select plan_name from public.subscriptions where id = p_sub), 'ventas/suscripciones');
 end $$;
 
 -- ---------------------------------------------------------------------
@@ -564,6 +700,10 @@ alter table public.sales         enable row level security;
 alter table public.subscriptions enable row level security;
 alter table public.payments      enable row level security;
 alter table public.messages      enable row level security;
+alter table public.notifications enable row level security;
+alter table public.chat_reads    enable row level security;
+alter table public.payouts       enable row level security;
+alter table public.quotes        enable row level security;
 
 drop policy if exists groups_select on public.groups;
 create policy groups_select on public.groups for select to authenticated
@@ -625,6 +765,20 @@ drop policy if exists messages_insert on public.messages;
 create policy messages_insert on public.messages for insert to authenticated
   with check (group_id = my_group() and sender_id = auth.uid() and can_message(recipient_id));
 
+drop policy if exists notifications_select on public.notifications;
+create policy notifications_select on public.notifications for select to authenticated using (user_id = auth.uid());
+drop policy if exists chat_reads_select on public.chat_reads;
+create policy chat_reads_select on public.chat_reads for select to authenticated using (user_id = auth.uid());
+drop policy if exists payouts_select on public.payouts;
+create policy payouts_select on public.payouts for select to authenticated
+  using (group_id = my_group() and (my_role() = 'coordinador' or seller_id = auth.uid()));
+drop policy if exists quotes_select on public.quotes;
+create policy quotes_select on public.quotes for select to authenticated
+  using (group_id = my_group() and (my_role() = 'coordinador' or seller_id = auth.uid()));
+drop policy if exists quotes_insert on public.quotes;
+create policy quotes_insert on public.quotes for insert to authenticated
+  with check (my_role() = 'vendedor' and group_id = my_group() and seller_id = auth.uid());
+
 -- ---------------------------------------------------------------------
 -- 7. PERMISOS (principio de mínimo privilegio)
 -- ---------------------------------------------------------------------
@@ -633,12 +787,14 @@ revoke all on all sequences in schema public from anon, authenticated;
 revoke execute on all functions in schema public from public, anon, authenticated;
 
 grant select on public.groups, public.profiles, public.catalog, public.group_prices, public.clients,
-                public.activities, public.sales, public.subscriptions, public.payments, public.messages
+                public.activities, public.sales, public.subscriptions, public.payments, public.messages,
+                public.notifications, public.chat_reads, public.payouts, public.quotes
   to authenticated;
 grant update (username, whatsapp) on public.profiles to authenticated;
 grant update (sale_price, seller_commission) on public.group_prices to authenticated;
-grant insert (name, business, phone, city, notes, next_followup) on public.clients to authenticated;
-grant update (name, business, phone, city, notes, status, next_followup) on public.clients to authenticated;
+grant insert (name, business, phone, city, notes, next_followup, followup_time) on public.clients to authenticated;
+grant update (name, business, phone, city, notes, status, next_followup, followup_time) on public.clients to authenticated;
+grant insert (client_id, client_name, items, once_total, monthly_total) on public.quotes to authenticated;
 grant insert (client_id, type, note) on public.activities to authenticated;
 grant insert (recipient_id, body) on public.messages to authenticated;
 
@@ -646,7 +802,8 @@ grant execute on function public.my_group(), public.my_role(), public.can_messag
   public.set_member_status(uuid, text), public.set_goal(uuid, numeric),
   public.create_sale(uuid, uuid, text), public.submit_payment(uuid, uuid, date, text, text),
   public.review_payment(uuid, boolean, text), public.set_delivery(uuid, text),
-  public.set_subscription_status(uuid, text)
+  public.set_subscription_status(uuid, text), public.register_payout(uuid, numeric, text),
+  public.mark_notifications_read(uuid[]), public.mark_chat_read(text)
   to authenticated;
 grant execute on function public.check_group_code(text), public.username_available(text) to anon, authenticated;
 
@@ -673,7 +830,7 @@ do $$
 declare t text;
 begin
   if exists (select 1 from pg_publication where pubname = 'supabase_realtime') then
-    foreach t in array array['messages','group_prices','profiles','payments','sales','subscriptions'] loop
+    foreach t in array array['messages','group_prices','profiles','payments','sales','subscriptions','notifications','chat_reads','payouts'] loop
       if not exists (select 1 from pg_publication_tables
                      where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = t) then
         execute format('alter publication supabase_realtime add table public.%I', t);
